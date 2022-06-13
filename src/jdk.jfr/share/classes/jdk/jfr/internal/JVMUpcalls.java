@@ -103,6 +103,10 @@ final class JVMUpcalls {
         try {
             EventInstrumentation ei = new EventInstrumentation(superClass, oldBytes, traceId, bootClassLoader, true);
             eventName = ei.getEventName();
+            if (!Utils.shouldInstrument(bootClassLoader,  ei.getEventName())) {
+                Logger.log(LogTag.JFR_SYSTEM, LogLevel.INFO, "Skipping instrumentation for " + eventName + " since container support is missing");
+                return oldBytes;
+            }
             if (!forceInstrumentation) {
                 // Assume we are recording
                 MetadataRepository mr = MetadataRepository.getInstance();

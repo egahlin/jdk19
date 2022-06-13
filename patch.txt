@@ -1,0 +1,157 @@
+diff --git a/src/hotspot/share/jfr/jni/jfrJniMethod.cpp b/src/hotspot/share/jfr/jni/jfrJniMethod.cpp
+index b47ba8fd6a8..3ac66ada5bd 100644
+--- a/src/hotspot/share/jfr/jni/jfrJniMethod.cpp
++++ b/src/hotspot/share/jfr/jni/jfrJniMethod.cpp
+@@ -61,6 +61,10 @@
+ #include "runtime/thread.hpp"
+ #include "utilities/debug.hpp"
+ 
++#ifdef LINUX
++#include "osContainer_linux.hpp"
++#endif
++
+ #define NO_TRANSITION(result_type, header) extern "C" { result_type JNICALL header {
+ #define NO_TRANSITION_END } }
+ 
+@@ -381,3 +385,16 @@ JVM_END
+ JVM_ENTRY_NO_ENV(jboolean, jfr_is_class_instrumented(JNIEnv* env, jobject jvm, jclass clazz))
+   return JfrJavaSupport::is_instrumented(clazz, thread);
+ JVM_END
++
++JVM_ENTRY_NO_ENV(jboolean, jfr_could_be_containerized(JNIEnv* env, jobject jvm))
++#ifdef LINUX
++  if (!UseContainerSupport) {
++    // if -XX:-UseContainerSupport has been specified, OSContainer::is_containerized()
++    // will not detect containerization. Return true optimistically.
++    return true;
++  }
++  return OSContainer::is_containerized();
++#else
++  return false;
++#endif
++JVM_END
+diff --git a/src/hotspot/share/jfr/jni/jfrJniMethod.hpp b/src/hotspot/share/jfr/jni/jfrJniMethod.hpp
+index 28aa70f3796..da8bf1105d4 100644
+--- a/src/hotspot/share/jfr/jni/jfrJniMethod.hpp
++++ b/src/hotspot/share/jfr/jni/jfrJniMethod.hpp
+@@ -158,6 +158,8 @@ jboolean JNICALL jfr_is_class_excluded(JNIEnv* env, jobject jvm, jclass clazz);
+ 
+ jboolean JNICALL jfr_is_class_instrumented(JNIEnv* env, jobject jvm, jclass clazz);
+ 
++jboolean JNICALL jfr_could_be_containerized(JNIEnv* env, jobject jvm);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/hotspot/share/jfr/jni/jfrJniMethodRegistration.cpp b/src/hotspot/share/jfr/jni/jfrJniMethodRegistration.cpp
+index 91f3264367f..454c6a3227f 100644
+--- a/src/hotspot/share/jfr/jni/jfrJniMethodRegistration.cpp
++++ b/src/hotspot/share/jfr/jni/jfrJniMethodRegistration.cpp
+@@ -93,7 +93,8 @@ JfrJniMethodRegistration::JfrJniMethodRegistration(JNIEnv* env) {
+       (char*)"setConfiguration", (char*)"(Ljava/lang/Class;Ljdk/jfr/internal/event/EventConfiguration;)Z", (void*)jfr_set_configuration,
+       (char*)"getTypeId", (char*)"(Ljava/lang/String;)J", (void*)jfr_get_type_id_from_string,
+       (char*)"isExcluded", (char*)"(Ljava/lang/Class;)Z", (void*)jfr_is_class_excluded,
+-      (char*)"isInstrumented", (char*)"(Ljava/lang/Class;)Z", (void*) jfr_is_class_instrumented
++      (char*)"isInstrumented", (char*)"(Ljava/lang/Class;)Z", (void*) jfr_is_class_instrumented,
++      (char*)"couldBeContainerized", (char*)"()Z", (void*) jfr_could_be_containerized
+     };
+ 
+     const size_t method_array_length = sizeof(method) / sizeof(JNINativeMethod);
+diff --git a/src/jdk.jfr/share/classes/jdk/jfr/internal/JVM.java b/src/jdk.jfr/share/classes/jdk/jfr/internal/JVM.java
+index 28db9c4257f..6d4cd8b06c8 100644
+--- a/src/jdk.jfr/share/classes/jdk/jfr/internal/JVM.java
++++ b/src/jdk.jfr/share/classes/jdk/jfr/internal/JVM.java
+@@ -620,4 +620,11 @@ public final class JVM {
+      * @return the id, or a negative value if it does not exists.
+      */
+     public native long getTypeId(String name);
++
++    /**
++     * Returns {@code true}, if the JVM may be running in a container, {@code false} otherwise.
++     * <p>
++     * The uncertainty exists if -XX:-UseContainerSupport has been specified.
++     */
++    public native boolean couldBeContainerized();
+ }
+diff --git a/src/jdk.jfr/share/classes/jdk/jfr/internal/JVMUpcalls.java b/src/jdk.jfr/share/classes/jdk/jfr/internal/JVMUpcalls.java
+index ca97b4dbd33..ae39af28507 100644
+--- a/src/jdk.jfr/share/classes/jdk/jfr/internal/JVMUpcalls.java
++++ b/src/jdk.jfr/share/classes/jdk/jfr/internal/JVMUpcalls.java
+@@ -103,6 +103,10 @@ final class JVMUpcalls {
+         try {
+             EventInstrumentation ei = new EventInstrumentation(superClass, oldBytes, traceId, bootClassLoader, true);
+             eventName = ei.getEventName();
++            if (!Utils.shouldInstrument(bootClassLoader,  ei.getEventName())) {
++                Logger.log(LogTag.JFR_SYSTEM, LogLevel.INFO, "Skipping instrumentation for " + eventName + " since container support is missing");
++                return oldBytes;
++            }
+             if (!forceInstrumentation) {
+                 // Assume we are recording
+                 MetadataRepository mr = MetadataRepository.getInstance();
+diff --git a/src/jdk.jfr/share/classes/jdk/jfr/internal/MetadataRepository.java b/src/jdk.jfr/share/classes/jdk/jfr/internal/MetadataRepository.java
+index 2ebbf1c4c8a..b16738b52fa 100644
+--- a/src/jdk.jfr/share/classes/jdk/jfr/internal/MetadataRepository.java
++++ b/src/jdk.jfr/share/classes/jdk/jfr/internal/MetadataRepository.java
+@@ -218,7 +218,7 @@ public final class MetadataRepository {
+         EventConfiguration configuration = newEventConfiguration(eventType, ec, settings);
+         PlatformEventType pe = configuration.getPlatformEventType();
+         pe.setRegistered(true);
+-        if (jvm.isInstrumented(eventClass)) {
++        if (jvm.isInstrumented(eventClass) || !Utils.shouldInstrument(pe.isJDK(), pe.getName())) {
+             pe.setInstrumented();
+         }
+         Utils.setConfiguration(eventClass, configuration);
+diff --git a/src/jdk.jfr/share/classes/jdk/jfr/internal/Utils.java b/src/jdk.jfr/share/classes/jdk/jfr/internal/Utils.java
+index 910edf01efd..ef94b9f15ae 100644
+--- a/src/jdk.jfr/share/classes/jdk/jfr/internal/Utils.java
++++ b/src/jdk.jfr/share/classes/jdk/jfr/internal/Utils.java
+@@ -94,7 +94,6 @@ public final class Utils {
+      * This field will be lazily initialized and the access is not synchronized.
+      * The possible data race is benign and is worth of not introducing any contention here.
+      */
+-    private static Metrics[] metrics;
+     private static Instant lastTimestamp;
+ 
+     public static void checkAccessFlightRecorder() throws SecurityException {
+@@ -698,18 +697,14 @@ public final class Utils {
+         }
+     }
+ 
+-    public static boolean shouldSkipBytecode(String eventName, Class<?> superClass) {
+-        if (superClass.getClassLoader() != null || !superClass.getName().equals("jdk.jfr.events.AbstractJDKEvent")) {
+-            return false;
++    public static boolean shouldInstrument(boolean isJDK, String eventName) {
++        if (!isJDK) {
++            return true;
+         }
+-        return eventName.startsWith("jdk.Container") && getMetrics() == null;
+-    }
+-
+-    private static Metrics getMetrics() {
+-        if (metrics == null) {
+-            metrics = new Metrics[]{Metrics.systemMetrics()};
++        if (!eventName.startsWith("jdk.Container")) {
++            return true;
+         }
+-        return metrics[0];
++        return JVM.getJVM().couldBeContainerized();
+     }
+ 
+     private static String formatPositiveDuration(Duration d){
+diff --git a/src/jdk.jfr/share/classes/jdk/jfr/internal/instrument/JDKEvents.java b/src/jdk.jfr/share/classes/jdk/jfr/internal/instrument/JDKEvents.java
+index 0f19965db7b..4136285d5dc 100644
+--- a/src/jdk.jfr/share/classes/jdk/jfr/internal/instrument/JDKEvents.java
++++ b/src/jdk.jfr/share/classes/jdk/jfr/internal/instrument/JDKEvents.java
+@@ -174,7 +174,11 @@ public final class JDKEvents {
+     }
+ 
+     private static void initializeContainerEvents() {
+-        containerMetrics = Container.metrics();
++        if (JVM.getJVM().couldBeContainerized() ) {
++            containerMetrics = Container.metrics();
++        }
++        // The registration and hooks are needed to provide metadata,
++        // even when not running in a container
+         SecuritySupport.registerEvent(ContainerConfigurationEvent.class);
+         SecuritySupport.registerEvent(ContainerCPUUsageEvent.class);
+         SecuritySupport.registerEvent(ContainerCPUThrottlingEvent.class);

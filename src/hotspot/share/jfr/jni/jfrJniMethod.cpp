@@ -61,6 +61,10 @@
 #include "runtime/thread.hpp"
 #include "utilities/debug.hpp"
 
+#ifdef LINUX
+#include "osContainer_linux.hpp"
+#endif
+
 #define NO_TRANSITION(result_type, header) extern "C" { result_type JNICALL header {
 #define NO_TRANSITION_END } }
 
@@ -380,4 +384,17 @@ JVM_END
 
 JVM_ENTRY_NO_ENV(jboolean, jfr_is_class_instrumented(JNIEnv* env, jobject jvm, jclass clazz))
   return JfrJavaSupport::is_instrumented(clazz, thread);
+JVM_END
+
+JVM_ENTRY_NO_ENV(jboolean, jfr_could_be_containerized(JNIEnv* env, jobject jvm))
+#ifdef LINUX
+  if (!UseContainerSupport) {
+    // if -XX:-UseContainerSupport has been specified, OSContainer::is_containerized()
+    // will not detect containerization. Return true optimistically.
+    return true;
+  }
+  return OSContainer::is_containerized();
+#else
+  return false;
+#endif
 JVM_END

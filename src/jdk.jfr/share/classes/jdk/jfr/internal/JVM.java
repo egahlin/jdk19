@@ -620,4 +620,11 @@ public final class JVM {
      * @return the id, or a negative value if it does not exists.
      */
     public native long getTypeId(String name);
+
+    /**
+     * Returns {@code true}, if the JVM may be running in a container, {@code false} otherwise.
+     * <p>
+     * The uncertainty exists if -XX:-UseContainerSupport has been specified.
+     */
+    public native boolean couldBeContainerized();
 }
